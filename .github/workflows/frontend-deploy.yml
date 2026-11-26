@@ -1,0 +1,108 @@
+# Build -> deploy, without Docker and without SSH.
+#
+#  1. `build` (GitHub-hosted runner): installs dependencies, builds the Vite SPA into
+#     `dist/`, and uploads it as a workflow artifact.
+#  2. `deploy` (self-hosted runner installed ON the server): downloads that artifact and
+#     replaces the contents of the web root (default: $HOME/Nginx/dist/shopco), which
+#     the server's Nginx serves. The runner connects out to GitHub over HTTPS, so the
+#     server needs no inbound SSH and GitHub holds no SSH key.
+#
+# The API base URL is baked into the bundle at build time from the API_URL secret
+# (read by the app as VITE_DOMAIN, see utils/http.ts).
+
+name: Frontend Deploy
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never run two deploys to the server at the same time.
+concurrency:
+  group: deploy-frontend-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build SPA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm 10 matches the lockfile format (lockfileVersion 9.0).
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        env:
+          VITE_DOMAIN: ${{ secrets.API_URL }}
+        run: pnpm build
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Deploy to server
+    needs: build
+    # Runs only on the self-hosted runner registered on the server (label: shopco-frontend).
+    runs-on: [self-hosted, Linux, ARM64, Oracle-ARM64]
+    # Add required reviewers to this environment in GitHub Settings if you want approvals.
+    environment: production
+    permissions:
+      contents: read
+    env:
+      # Web root on the server. Override with the DEPLOY_DIR repository variable.
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+    steps:
+      - name: Download dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Check server prerequisites
+        run: |
+          TARGET="${DEPLOY_DIR:-$HOME/Nginx/dist/shopco}"
+          mkdir -p "$(dirname "$TARGET")"
+          echo "TARGET_DIR=$TARGET" >> "$GITHUB_ENV"
+          echo "Deploying to $TARGET"
+
+      # Stage the new build next to the web root, then swap it in, so Nginx never
+      # serves a half-copied directory.
+      - name: Replace web root
+        run: |
+          STAGE="${TARGET_DIR}.new"
+          OLD="${TARGET_DIR}.old"
+          rm -rf "$STAGE" "$OLD"
+          mkdir -p "$STAGE"
+          cp -a dist/. "$STAGE/"
+          chmod -R a+rX "$STAGE"
+          if [ -e "$TARGET_DIR" ]; then
+            mv "$TARGET_DIR" "$OLD"
+          fi
+          mv "$STAGE" "$TARGET_DIR"
+          rm -rf "$OLD"
+
+      # Fail the deploy if the expected entry point is missing.
+      - name: Verify deployed files
+        run: |
+          test -f "$TARGET_DIR/index.html" || { echo "index.html missing in $TARGET_DIR"; exit 1; }
+          ls -la "$TARGET_DIR"
+          echo "Deployed $(find "$TARGET_DIR" -type f | wc -l) files to $TARGET_DIR"
