@@ -140,7 +140,10 @@ const router = createBrowserRouter([
             },
         ],
     },
-]);
+], {
+    // Mount the router under Vite's base (e.g. "/shopco/" -> "/shopco") so routes match.
+    basename: import.meta.env.BASE_URL.replace(/\/$/, ""),
+});
 
 function App() {
     return (
